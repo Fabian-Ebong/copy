@@ -1,0 +1,520 @@
+---
+            schemaVersion: "0.3"
+            description: "Deploy AD with SSM Automation"
+            # Role that is utilized to perform the steps within the Automation Document. In this case to be able to Signal CFN and Describe Instances. 
+            assumeRole: "{{AutomationAssumeRole}}"
+            # Gathering parameters needed to configure DCs
+            parameters: 
+              AutomationAssumeRole:
+                default: "arn:aws:iam::190251063267:role/dc-role-UAT"
+                description: "(Required) The ARN of the role that allows Auotmation to perform the actions."
+                type: "String"
+              ADServer1NetBIOSName:
+                default: "ccaddse1uat1"
+                description: "NetBIOS name of the first Active Directory server (up to 15 characters)"
+                type: "String"
+              ADServer1PrivateIP:
+                default: "10.101.245.11"
+                description: "Fixed private IP for the first Active Directory server located in Availability Zone 1"
+                type: "String"
+              ADServer2NetBIOSName:
+                default: "ccaddse1uat2"
+                description: "NetBIOS name of the first Active Directory server (up to 15 characters)"
+                type: "String"
+              ADServer2PrivateIP:
+                default: "10.101.246.11"
+                description: "Fixed private IP for the second Active Directory server located in Availability Zone 2"
+                type: "String"
+              VPCCIDR:
+                default: '10.101.244.0/22'
+                description: "CIDR block for VPC."
+                type: "String"
+              SECONDARYVPCCIDR:
+                default: "10.101.203.0/24"
+                description: "CIDR block for WEST-2 VPC."
+                type: "String"
+              DomainDnsName: 
+                default: "uat.ad.cc-pod2.infra.marcus.com"
+                description: "Fully qualified domain name (FQDN) of the forest root domain e.g. example.com"
+                type: "String"
+              DomainNetBIOSName: 
+                default: "cc-pod2-uat"
+                description: "NetBIOS name of the domain (up to 15 characters) for users of earlier versions of Windows e.g. EXAMPLE"
+                type: "String"
+              AdminSecrets:
+                default: "UAT/ad_admin-secret"
+                description: "AWS Secrets Parameter Name that has Password and User name for a domain administrator."
+                type: "String"      
+              RestoreUser:
+                default: "UAT/ad_restore-secret"
+                type: "String"
+              UnjoinUser:
+                default: "UAT/ad_unjoin-secret"
+                type: "String"
+              AltUser:
+                default: "UAT/ad_alt_admin-secret"
+                type: "String"
+              AppSecrets:
+                default: ["UAT/ad_admin-secret","UAT/ad_alt_admin-secret","UAT/ad_restore-secret","UAT/ad_unjoin-secret","UAT/app-admin-secret","UAT/app-rdponly-secret","UAT/kms-admin-secret","UAT/kms-admin-secret","UAT/kms-rdponly-secret","UAT/db-admin-secret","UAT/db-dbo-secret","UAT/db-rdponly-secret","UAT/db-ro-secret","UAT/db-rw-secret","UAT/web-admin-secret","UAT/web-rdponly-secret"]
+                type: "StringList"
+              GMSASecrets:
+                default: ["UAT/web-service-secret"]
+                type: "StringList"
+              UserGroups:
+                default: ["mGSA-App-Servers","mGSA-KMS-Servers","mGSA-SQL-Servers","mGSA-Web-Servers","RDP_users-APP","RDP_users-KMS","RDP_users-SQL","RDP_users-Web","Admin_users-App","Admin_users-KMS","Admin_users-SQL","Admin_users-Web"]
+                type: "StringList"
+              Environment:
+                default: "UAT"
+                type: "String"
+              FileDirectoryName:
+                default: "GSCC-AD"
+                description: "The path you want to use for this template."
+                type: "String"
+              AdScriptsPath:
+                default: "C:/scripts/ad"
+                description: "The directory that holds the files for AD configuration."
+                type: "String"
+              MinimumPasswordAge:
+                default: "0"
+                description: "Sets the minimum password age for the default group policy object."
+                type: "String"
+            
+            mainSteps:
+            # This step grabs the Instance IDs for both nodes that will be configured as DCs and Instance IDs for the for next steps.
+            - name: "dcsInstanceIds"
+              action: aws:executeAwsApi
+              onFailure: "Abort"
+              nextStep: "dcsInstallDscModules"
+              inputs:
+                Service: ec2
+                Api: DescribeInstances
+                Filters:  
+                - Name: "tag:Name"
+                  Values: [ "{{ADServer1NetBIOSName}}","{{ADServer2NetBIOSName}}" ]
+                - Name: "instance-state-name"
+                  Values: [ "running" ]
+              outputs:
+              - Name: InstanceIds
+                Selector: "$.Reservations..Instances..InstanceId"
+                Type: "StringList"
+                
+            # Installs needed Powershell DSC Modules and components on both nodes.
+            - name: "dcsInstallDscModules"
+              action: "aws:runCommand"
+              nextStep: "dcsLCMConfig"
+              inputs:
+                DocumentName: "AWS-RunPowerShellScript"
+                InstanceIds:
+                - "{{dcsInstanceIds.InstanceIds}}"
+                CloudWatchOutputConfig:
+                  CloudWatchOutputEnabled: "true"
+                  CloudWatchLogGroupName: "cc-pod2-ad-UAT-ssm-adconfig"
+                Parameters:
+                  commands: 
+                    - |
+                        {{AdScriptsPath}}\install-ad-modules.ps1
+            
+            # Configures Local Configuration Manager on each of the nodes.
+            - name: "dcsLCMConfig"
+              action: "aws:runCommand"
+              onFailure: "Abort"
+              nextStep: "dc1InstanceId"
+              inputs:
+                DocumentName: "AWS-RunPowerShellScript"
+                InstanceIds:
+                - "{{dcsInstanceIds.InstanceIds}}"
+                CloudWatchOutputConfig:
+                  CloudWatchOutputEnabled: "true"
+                  CloudWatchLogGroupName: "cc-pod2-ad-UAT-ssm-adconfig"
+                Parameters:
+                  commands:
+                    - |
+                        {{AdScriptsPath}}\LCM-Config.ps1
+            
+            # This step grabs the Instance ID for the node that will be configured as the first DC in the new domain.
+            - name: "dc1InstanceId"
+              action: aws:executeAwsApi
+              onFailure: "Abort"
+              nextStep: "createDC1Mof"
+              inputs:
+                Service: ec2
+                Api: DescribeInstances
+                Filters:  
+                - Name: "tag:Name"
+                  Values: [ "{{ADServer1NetBIOSName}}" ]
+                - Name: "instance-state-name"
+                  Values: [ "running" ]
+              outputs:
+              - Name: InstanceId
+                Selector: "$.Reservations[0].Instances[0].InstanceId"
+                Type: "String"
+            
+            # Generates MOF file on first DC Node to be processed by LCM.
+            # Changes for multi-region: 
+              # 1: Added "primary" and "secondary" site names. It makes more sense to create them all at the same time
+                # Need to make these variables and push them in. Hard coded right now.
+              # 2: Added "primary" and "secondary" VPCCIDR. These are the cidrs for east1/west2. 
+                # Need to make these variables and push them in. Hard coded right now.
+            - name: "createDC1Mof"
+              action: "aws:runCommand"
+              onFailure: "Abort"
+              nextStep: "configDC1"
+              inputs:
+                DocumentName: "AWS-RunPowerShellScript"
+                InstanceIds:
+                - "{{dc1InstanceId.InstanceId}}"
+                CloudWatchOutputConfig:
+                  CloudWatchOutputEnabled: "true"
+                  CloudWatchLogGroupName: "cc-pod2-ad-UAT-ssm-adconfig"
+                Parameters:
+                  commands: 
+                    - |
+                        {{AdScriptsPath}}\ConfigDC1.ps1 -ADServer1NetBIOSName {{ADServer1NetBIOSName}} -domainNetBIOSName {{DomainNetBIOSName}} -DomainDNSName {{DomainDnsName}} -ADAdminSecParam {{AdminSecrets}} -ADAltUserSecParam {{AltUser}} -ADUnjoinUserSecParam {{UnjoinUser}} -RestoreModeSecParam {{RestoreUser}} -PrimarySiteName {{global:REGION}} -SecondarySiteName us-west-2 -PrimaryVPCCIDR {{VPCCIDR}} -SecondaryVPCCIDR  {{SECONDARYVPCCIDR}}
+            
+            # Kicks off DSC Configuration and loops\reboots until Node matches Configuration defined in MOF file.
+            - name: "configDC1"
+              action: aws:runCommand
+              onFailure: "Abort"
+              nextStep: "setDefaultDomainPasswordPolicyMof"
+              inputs:
+                DocumentName: AWS-RunPowerShellScript
+                InstanceIds: 
+                  - "{{dc1InstanceId.InstanceId}}"
+                CloudWatchOutputConfig:
+                  CloudWatchOutputEnabled: "true"
+                  CloudWatchLogGroupName: "cc-pod2-ad-UAT-ssm-adconfig"
+                Parameters:
+                  commands: 
+                    - |     
+                       function DscStatusCheck () {
+                           $LCMState = (Get-DscLocalConfigurationManager).LCMState
+                           if ($LCMState -eq 'PendingConfiguration' -Or $LCMState -eq 'PendingReboot') {
+                               'returning 3010, should continue after reboot'
+                               exit 3010
+                           } else {
+                             Get-ChildItem C:\Windows\system32\CertSrv\CertEnroll *.crt | Copy-Item -Destination c:\inetpub\wwwroot\cert.crt  
+                             'Completed'
+                           }
+                       }
+                       
+                       Start-DscConfiguration 'C:\{{FileDirectoryName}}\ConfigDC1' -Wait -Verbose -Force
+                       
+                       DscStatusCheck
+            
+            - name: "setDefaultDomainPasswordPolicyMof"
+              action: aws:runCommand
+              onFailure: "Abort"
+              nextStep: "setDefaultDomainPasswordPolicyConfig"
+              inputs:
+                DocumentName: AWS-RunPowerShellScript
+                InstanceIds: 
+                  - "{{dc1InstanceId.InstanceId}}"
+                CloudWatchOutputConfig:
+                  CloudWatchOutputEnabled: "true"
+                  CloudWatchLogGroupName: "cc-pod2-ad-UAT-ssm-adconfig"
+                Parameters:
+                  commands: 
+                    - |     
+                       {{AdScriptsPath}}\Set-ADDefaultDomainPasswordPolicy.ps1 -DomainNetBIOSName {{DomainNetBIOSName}} -DomainDNSName {{DomainDnsName}} -ADAdminSecParam {{AdminSecrets}} -MinPasswordAge {{MinimumPasswordAge}}
+            
+            - name: "setDefaultDomainPasswordPolicyConfig"
+              action: aws:runCommand
+              onFailure: "Abort"
+              nextStep: "addDomainUsersMof"  
+              inputs:
+                DocumentName: AWS-RunPowerShellScript
+                InstanceIds: 
+                  - "{{dc1InstanceId.InstanceId}}"
+                CloudWatchOutputConfig:
+                  CloudWatchOutputEnabled: "true"
+                  CloudWatchLogGroupName: "cc-pod2-ad-UAT-ssm-adconfig"
+                Parameters:
+                  commands: 
+                    - |     
+                        function DscStatusCheck () {
+                            $LCMState = (Get-DscLocalConfigurationManager).LCMState
+                            if ($LCMState -eq 'PendingConfiguration' -Or $LCMState -eq 'PendingReboot') {
+                                'returning 3010, should continue after reboot'
+                                exit 3010
+                            } else {
+                              'Completed'
+                            }
+                        }
+                        
+                        Start-DscConfiguration 'C:\{{FileDirectoryName}}\SetDefaultDomainPasswordPolicy' -Wait -Verbose -Force
+            
+                        DscStatusCheck
+            
+            # Creates users and groups. Not working fully yet. Still tweaking.
+            - name: "addDomainUsersMof"
+              action: aws:runCommand
+              onFailure: "Abort"
+              nextStep: "addDomainUsersConfig"
+              inputs:
+                DocumentName: AWS-RunPowerShellScript
+                InstanceIds: 
+                  - "{{dc1InstanceId.InstanceId}}"
+                CloudWatchOutputConfig:
+                  CloudWatchOutputEnabled: "true"
+                  CloudWatchLogGroupName: "cc-pod2-ad-UAT-ssm-adconfig"
+                Parameters:
+                  commands: 
+                    - |     
+                       {{AdScriptsPath}}\CreateAppUsers.ps1 -DomainNetBIOSName {{DomainNetBIOSName}} -DomainDNSName {{DomainDnsName}} -ADAdminSecParam {{AdminSecrets}} -APPUserSecParam {{AppSecrets}}
+            
+            # This step starts the DSC Configuration and loops until regular users match Configuration defined in MOF file.
+            - name: "addDomainUsersConfig"
+              action: aws:runCommand
+              onFailure: "Abort"
+              nextStep: "addCreateGroupsConfig"  
+              inputs:
+                DocumentName: AWS-RunPowerShellScript
+                InstanceIds: 
+                  - "{{dc1InstanceId.InstanceId}}"
+                CloudWatchOutputConfig:
+                  CloudWatchOutputEnabled: "true"
+                  CloudWatchLogGroupName: "cc-pod2-ad-UAT-ssm-adconfig"
+                Parameters:
+                  commands: 
+                    - |     
+                        function DscStatusCheck () {
+                            $LCMState = (Get-DscLocalConfigurationManager).LCMState
+                            if ($LCMState -eq 'PendingConfiguration' -Or $LCMState -eq 'PendingReboot') {
+                                'returning 3010, should continue after reboot'
+                                exit 3010
+                            } else {
+                              'Completed'
+                            }
+                        }
+                        
+                        Start-DscConfiguration 'C:\{{FileDirectoryName}}\CreateAppUsers' -Wait -Verbose -Force
+            
+                        DscStatusCheck
+            
+            # This step creates single or multiple groups if not present
+            - name: "addCreateGroupsConfig"
+              action: aws:runCommand
+              onFailure: "Abort"
+              nextStep: "addCreateGroupsMof"
+              inputs:
+                DocumentName: AWS-RunPowerShellScript
+                InstanceIds: 
+                  - "{{dc1InstanceId.InstanceId}}"
+                CloudWatchOutputConfig:
+                  CloudWatchOutputEnabled: "true"
+                  CloudWatchLogGroupName: "cc-pod2-ad-UAT-ssm-adconfig"
+                Parameters:
+                  commands: 
+                    - |     
+                       {{AdScriptsPath}}\CreateGroups.ps1 -DomainNetBIOSName {{DomainNetBIOSName}} -DomainDNSName {{DomainDnsName}} -UserGroupsSecParam {{UserGroups}}
+            
+            # This step starts the DSC Configuration and loops until groups match Configuration defined in MOF file.
+            - name: "addCreateGroupsMof"
+              action: aws:runCommand
+              onFailure: "Abort"
+              nextStep: "addgMSAConfig"  
+              inputs:
+                DocumentName: AWS-RunPowerShellScript
+                InstanceIds: 
+                  - "{{dc1InstanceId.InstanceId}}"
+                CloudWatchOutputConfig:
+                  CloudWatchOutputEnabled: "true"
+                  CloudWatchLogGroupName: "cc-pod2-ad-UAT-ssm-adconfig"
+                Parameters:
+                  commands: 
+                    - |     
+                        function DscStatusCheck () {
+                            $LCMState = (Get-DscLocalConfigurationManager).LCMState
+                            if ($LCMState -eq 'PendingConfiguration' -Or $LCMState -eq 'PendingReboot') {
+                                'returning 3010, should continue after reboot'
+                                exit 3010
+                            } else {
+                              'Completed'
+                            }
+                        }
+                        
+                        Start-DscConfiguration 'C:\{{FileDirectoryName}}\CreateGroups' -Wait -Verbose -Force
+            
+                        DscStatusCheck
+            
+            # This step creates single or multiple gMSA if not present
+            - name: "addgMSAConfig"
+              action: aws:runCommand
+              onFailure: "Abort"
+              nextStep: "addgMSAMof"
+              inputs:
+                DocumentName: AWS-RunPowerShellScript
+                InstanceIds: 
+                  - "{{dc1InstanceId.InstanceId}}"
+                CloudWatchOutputConfig:
+                  CloudWatchOutputEnabled: "true"
+                  CloudWatchLogGroupName: "cc-pod2-ad-UAT-ssm-adconfig"
+                Parameters:
+                  commands: 
+                    - |     
+                       {{AdScriptsPath}}\CreategMSAAccount.ps1 -DomainNetBIOSName {{DomainNetBIOSName}} -DomainDNSName {{DomainDnsName}} -ADAdminSecParam {{AdminSecrets}} -gMSAUserSecParam {{GMSASecrets}}
+            
+            # This step starts the DSC Configuration and loops until gMSA matches Configuration defined in MOF file.
+            - name: "addgMSAMof"
+              action: aws:runCommand
+              onFailure: "Abort"
+              nextStep: "dc2InstanceId"  
+              inputs:
+                DocumentName: AWS-RunPowerShellScript
+                InstanceIds: 
+                  - "{{dc1InstanceId.InstanceId}}"
+                CloudWatchOutputConfig:
+                  CloudWatchOutputEnabled: "true"
+                  CloudWatchLogGroupName: "cc-pod2-ad-UAT-ssm-adconfig"
+                Parameters:
+                  commands: 
+                    - |     
+                        function DscStatusCheck () {
+                            $LCMState = (Get-DscLocalConfigurationManager).LCMState
+                            if ($LCMState -eq 'PendingConfiguration' -Or $LCMState -eq 'PendingReboot') {
+                                'returning 3010, should continue after reboot'
+                                exit 3010
+                            } else {
+                              'Completed'
+                            }
+                        }
+                        
+                        Start-DscConfiguration 'C:\{{FileDirectoryName}}\CreategMSA' -Wait -Verbose -Force
+            
+                        DscStatusCheck
+            
+            # This step grabs the Instance ID for the node that will be configured as the second DC in the new domain.
+            - name: "dc2InstanceId"
+              action: aws:executeAwsApi
+              onFailure: "Abort"
+              nextStep: "createDC2Mof"
+              inputs:
+                Service: ec2
+                Api: DescribeInstances
+                Filters:  
+                - Name: "tag:Name"
+                  Values: [ "{{ADServer2NetBIOSName}}" ]
+                - Name: "instance-state-name"
+                  Values: [ "running" ]
+              outputs:
+              - Name: InstanceId
+                Selector: "$.Reservations[0].Instances[0].InstanceId"
+                Type: "String"
+            
+            # Generates MOF file on second DC Node to be processed by LCM.
+            - name: "createDC2Mof"
+              action: "aws:runCommand"
+              onFailure: "Abort"
+              nextStep: "configDC2"
+              inputs:
+                DocumentName: "AWS-RunPowerShellScript"
+                InstanceIds:
+                - "{{dc2InstanceId.InstanceId}}"
+                CloudWatchOutputConfig:
+                  CloudWatchOutputEnabled: "true"
+                  CloudWatchLogGroupName: "cc-pod2-ad-UAT-ssm-adconfig"
+                Parameters:
+                  commands: 
+                    - |
+                        {{AdScriptsPath}}/ConfigDC2.ps1 -ADServer2NetBIOSName {{ADServer2NetBIOSName}} -DomainNetBIOSName {{DomainNetBIOSName}} -DomainDnsName {{DomainDnsName}} -ADServer1PrivateIP {{ADServer1PrivateIP}} -ADAdminSecParam {{AdminSecrets}}
+            
+            # Kicks off DSC Configuration and loops\reboots until Node matches Configuration defined in MOF file.
+            - name: "configDC2"
+              action: aws:runCommand
+              onFailure: "Abort"
+              nextStep: "DnsConfig"
+              inputs:
+                DocumentName: AWS-RunPowerShellScript
+                InstanceIds: 
+                  - "{{dc2InstanceId.InstanceId}}"
+                CloudWatchOutputConfig:
+                  CloudWatchOutputEnabled: "true"
+                  CloudWatchLogGroupName: "cc-pod2-ad-UAT-ssm-adconfig"
+                Parameters:
+                  commands: 
+                    - |     
+                       function DscStatusCheck () {
+                           $LCMState = (Get-DscLocalConfigurationManager).LCMState
+                           if ($LCMState -eq 'PendingConfiguration' -Or $LCMState -eq 'PendingReboot') {
+                               'returning 3010, should continue after reboot'
+                               exit 3010
+                           } else {
+                               Get-ChildItem C:\Windows\system32\CertSrv\CertEnroll *.crt | Copy-Item -Destination c:\inetpub\wwwroot\cert.crt
+                               'Completed'
+                           }
+                       }
+                       
+                       Start-DscConfiguration 'C:\{{FileDirectoryName}}\ConfigDC2' -Wait -Verbose -Force
+                       
+                       DscStatusCheck
+            
+            # Ensure that AD servers point to themselves for DNS
+            - name: "DnsConfig"
+              action: "aws:runCommand"
+              onFailure: "Abort"
+              nextStep: "addGPOs"
+              inputs:
+                DocumentName: "AWS-RunPowerShellScript"
+                InstanceIds:
+                  - "{{dc2InstanceId.InstanceId}}"
+                CloudWatchOutputConfig:
+                  CloudWatchOutputEnabled: "true"
+                  CloudWatchLogGroupName: "cc-pod2-ad-UAT-ssm-adconfig"
+                Parameters:
+                  commands: 
+                    - |
+                        {{AdScriptsPath}}/Dns-Config.ps1 -ADServer1NetBIOSName {{ADServer1NetBIOSName}} -ADServer2NetBIOSName {{ADServer2NetBIOSName}} -ADServer1PrivateIP {{ADServer1PrivateIP}} -ADServer2PrivateIP {{ADServer2PrivateIP}} -DomainDnsName {{DomainDnsName}} -ADAdminSecParam {{AdminSecrets}}
+            
+            - name: "addGPOs"
+              action: aws:runCommand
+              onFailure: "Abort"
+              nextStep: "removePasswordPromptGPOs"
+              inputs:
+                DocumentName: AWS-RunPowerShellScript
+                InstanceIds: 
+                  - "{{dc1InstanceId.InstanceId}}"
+                CloudWatchOutputConfig:
+                  CloudWatchOutputEnabled: "true"
+                  CloudWatchLogGroupName: "cc-pod2-ad-UAT-ssm-adconfig"
+                Parameters:
+                  commands: 
+                    - |     
+                       {{AdScriptsPath}}/add-gpos.ps1 -domain {{DomainDnsName}} -domainNetBIOSName {{DomainNetBIOSName}} -secretName {{AdminSecrets}}  -serverAppUserName {{AppSecrets}}
+            
+            - name: "removePasswordPromptGPOs"
+              action: aws:runCommand
+              onFailure: "Abort"
+              nextStep: "reduceTCPReceivePacketSize"
+              inputs:
+                DocumentName: AWS-RunPowerShellScript
+                InstanceIds: 
+                  - "{{dc1InstanceId.InstanceId}}"
+                CloudWatchOutputConfig:
+                  CloudWatchOutputEnabled: "true"
+                  CloudWatchLogGroupName: "cc-pod2-ad-UAT-ssm-adconfig"
+                Parameters:
+                  commands: 
+                    - |     
+                       {{AdScriptsPath}}/add-disable-password-gpos.ps1 -domain {{DomainDnsName}} -domainNetBIOSName {{DomainNetBIOSName}} -secretName {{AdminSecrets}} -serverAppUserName {{AppSecrets}}
+            
+            - name: "reduceTCPReceivePacketSize"
+              action: aws:runCommand
+              onFailure: "Abort"
+              nextStep: "sleepend"
+              inputs:
+                DocumentName: AWS-RunPowerShellScript
+                InstanceIds: 
+                  - "{{dc1InstanceId.InstanceId}}"
+                CloudWatchOutputConfig:
+                  CloudWatchOutputEnabled: "true"
+                  CloudWatchLogGroupName: "cc-pod2-ad-UAT-ssm-adconfig"
+                Parameters:
+                  commands: 
+                    - |     
+                       {{AdScriptsPath}}/Reduce-TCPReceivePacketsize.ps1 -domain {{DomainDnsName}} -domainNetBIOSName {{DomainNetBIOSName}} -secretName {{AdminSecrets}} -serverAppUserName {{AppSecrets}}
+                       
+            - name: "sleepend"
+              action: "aws:sleep"
+              isEnd: True
+              inputs:
+                Duration: PT1S

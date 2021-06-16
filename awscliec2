@@ -1,0 +1,9 @@
+#!/bin/bash
+
+aws ec2 run-instances \
+	--image-id ami-03fd797abb01df86a \
+	--count 1 \
+	--instance-type t2.micro \
+	--key-name Techfocus \
+	--security-group-ids sg-02e1d003fb5b35b50 \
+	--subnet-id subnet-034d3ae63f56802f2 \

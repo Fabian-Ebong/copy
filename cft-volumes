@@ -1,0 +1,67 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+
+Resources:
+
+  InstanceWithVolumeInline:
+
+    Type: AWS::EC2::Instance
+
+    Properties:
+
+      ImageId: "ami-0bd39c806c2335b95"
+
+      InstanceType: "t3.medium"
+
+      SubnetId: "subnet-xxxxxxxx"
+
+      BlockDeviceMappings:
+
+        - DeviceName: "/dev/xvda"
+
+          Ebs:
+
+            DeleteOnTermination: true
+
+            VolumeSize: 8
+
+            VolumeType: "gp3"   # Don't change this, it replaces the VM
+
+
+  InstanceWithVolumeSeparate:
+
+    Type: AWS::EC2::Instance
+
+    Properties:
+
+      ImageId: "ami-0bd39c806c2335b95"
+
+      InstanceType: "t3.medium"
+
+      SubnetId: "subnet-xxxxxxxx"
+
+
+  EbsVolume:
+
+    Type: AWS::EC2::Volume
+
+    Properties:
+
+      AvailabilityZone: "eu-central-1a"
+
+      Size: 8
+
+      VolumeType: "gp3"   # Easy to change
+
+
+  VolumeAttachment:
+
+    Type: AWS::EC2::VolumeAttachment
+
+    Properties:
+
+      Device: "/dev/sdh"
+
+      VolumeId: !Ref EbsVolume
+
+      InstanceId: !Ref InstanceWithVolumeSeparate
